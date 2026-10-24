@@ -1,0 +1,8 @@
+# Core domain — domain-independent utility skills, installed like any other domain.
+# Requires no env. Project-local in .agents/.
+
+name: core
+description: Core skills — domain-independent utilities always available: ultra-compressed output mode, project memory bank, memory bank defrag.
+
+requires_env: []
+

@@ -1,0 +1,4 @@
+# Advisory and executing DevOps skills. Production changes use GitOps.
+name: devops
+description: Kubernetes, Helm, GitLab CI, ArgoCD, architecture, security, SRE, and diagnostics.
+requires_env: []

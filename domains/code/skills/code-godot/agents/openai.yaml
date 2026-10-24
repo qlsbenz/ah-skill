@@ -1,0 +1,4 @@
+interface:
+  display_name: "Godot"
+  short_description: "Inspect, edit, validate, test, and export Godot projects"
+  default_prompt: "Use $godot to inspect, modify, validate, exercise, and export this Godot project with the bundled structured workflows."

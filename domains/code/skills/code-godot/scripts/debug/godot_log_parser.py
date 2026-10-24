@@ -1,0 +1,691 @@
+#!/usr/bin/env python3
+"""Parse Godot 4.7 stdout/stderr into structured diagnostics.
+
+The parser turns the raw text the Godot debugger prints when a project runs
+(runtime script errors, engine errors, ``push_error``/``push_warning`` output,
+and GDScript parse errors) into a list of structured diagnostics that a skill
+can act on: fix the referenced ``file:line``, then re-run to confirm.
+
+It is intentionally free of any Godot dependency so it can run anywhere and be
+unit tested against captured logs. It can be imported (``parse_log``) or used as
+a CLI that reads a log file or stdin and prints JSON.
+
+Recognised Godot 4.7 output shapes (captured from ``godot 4.7.stable``)::
+
+    SCRIPT ERROR: Invalid access to property or key 'position' on a base object of type 'null instance'.
+              at: _ready (res://scripts/main.gd:4)
+              GDScript backtrace (most recent call first):
+                  [0] _ready (res://scripts/main.gd:4)
+
+    ERROR: custom boom happened                 # from push_error()
+       at: push_error (core/variant/variant_utility.cpp:1023)
+       GDScript backtrace (most recent call first):
+           [0] _ready (res://scripts/main.gd:3)
+
+    WARNING: this is a warning                  # from push_warning()
+         at: push_warning (core/variant/variant_utility.cpp:1033)
+
+    SCRIPT ERROR: Parse Error: Identifier "foo" not declared in the current scope.
+              at: GDScript::reload (res://scripts/main.gd:3)
+
+GDScript analyzer warnings only appear in a log captured with
+``-d --ignore-error-breaks`` (see ``run_project.py``); they are attributed to
+``GDScript::reload`` rather than to a runtime function::
+
+    WARNING: The local variable "unused" is declared but never used in the block.
+         at: GDScript::reload (res://scripts/main.gd:6)
+
+Best-effort support is also included for the interactive ``-d`` debugger format
+(``Debugger Break, Reason: '...'`` / ``*Frame N - res://file:line``) and the
+timestamped ``E 0:00:...`` / ``<Stack Trace>`` format, so logs a user pastes by
+hand also parse. A ``Debugger Break`` in a captured log means the run stopped
+early at the local debugger's prompt — the sign that ``-d`` was passed without
+``--ignore-error-breaks``.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from typing import Optional
+
+
+# --- Header patterns -------------------------------------------------------
+# Order matters: the most specific prefix must be tried first. Each entry maps a
+# regex (matched against the left-stripped line) to a severity. Group 1 is the
+# human-readable message.
+_HEADER_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"^(?:USER )?SCRIPT ERROR:\s*Parse Error:\s*(.*)$"), "parse_error"),
+    (re.compile(r"^(?:USER )?SCRIPT ERROR:\s*(.*)$"), "script_error"),
+    (re.compile(r"^(?:USER )?SHADER ERROR:\s*(.*)$"), "shader_error"),
+    (re.compile(r"^(?:USER )?ERROR:\s*(.*)$"), "error"),
+    (re.compile(r"^(?:USER )?WARNING:\s*(.*)$"), "warning"),
+    # Interactive -d debugger break line (best effort).
+    (re.compile(r"^Debugger Break, Reason:\s*'(.*)'\s*$"), "script_error"),
+    # Timestamped print_error format: "E 0:00:01:0456   file.gd:10 @ _ready(): msg"
+    (re.compile(r"^E\s+\d[\d:]*\s+.*?:\d+\s+@\s+.*?:\s*(.*)$"), "script_error"),
+    (re.compile(r"^W\s+\d[\d:]*\s+.*?:\d+\s+@\s+.*?:\s*(.*)$"), "warning"),
+]
+
+# res:// location, e.g. "res://scripts/main.gd:4". res:// paths contain no ':'
+# other than the line-number separator, so stopping at the first ':' is safe.
+_RES_LOC = re.compile(r"(res://[^:\s()]+):(\d+)")
+
+# Resource-loader messages that lead with their own location, e.g.
+# "res://scenes/main.tscn:9 - Parse Error: [ext_resource] referenced ...".
+_RES_MSG_LOC = re.compile(r"^(res://[^:\s()]+):(\d+)\s*-\s")
+
+# Some engine messages name the file they are about inside quotes and carry no
+# location of their own — their `at:` line points into engine C++ source. The
+# scene-instantiation warning check_project surfaces is the important one:
+#   WARNING: Parent path './VBox' for node 'Label' has vanished when
+#            instantiating: 'res://ui/hud.tscn'.
+# Used only as a fallback, so a real `at:`/backtrace location always wins.
+_QUOTED_RES_PATH = re.compile(r"'(res://[^']+)'")
+
+# Shader compile errors report a bare line number with no path, because the
+# rendering server does not know which file the code came from:
+#     SHADER ERROR: Invalid arguments for the built-in function: ...
+#               at: (null) (:4)
+# check_project prints a marker naming the file right before it forces the
+# compile, which is what lets these be attributed to a path.
+_BARE_LINE_LOC = re.compile(r"^:(\d+)$")
+_SHADER_CONTEXT = re.compile(r"^\[INFO\]\s*Compiling shader:\s*(\S+)\s*$")
+
+# Node configuration warnings. The editor's yellow triangles are unreachable
+# from a --script run (Node::get_configuration_warnings() is not bound outside
+# the editor), so check_project re-derives them and prints one line per warning
+# in a shape this parser can file precisely:
+#
+#   WARNING: [node_config:body_without_shape] res://scenes/level.tscn::root/Player: This node has no shape, ...
+#      fix: add_node '{"scene_path":"res://scenes/level.tscn", ...}'
+#
+# The scene becomes `file` (these warnings are about a node, not a line), the
+# rule id and node path are kept, and the indented `fix:` continuation — which
+# is always a runnable dispatcher call — becomes `suggested_fix`.
+_NODE_CONFIG = re.compile(
+    r"^\[node_config:(?P<rule>[a-z0-9_]+)\]\s+(?P<file>res://[^\s]+?)::(?P<path>[^\s:]+):\s*(?P<message>.*)$"
+)
+_NODE_CONFIG_FIX = re.compile(r"^fix:\s*(?P<fix>.+)$")
+
+# "at: <func> (<loc>)" continuation line.
+_AT_LINE = re.compile(r"^at:\s*(?P<func>.*?)\s*\((?P<loc>[^()]*)\)\s*$")
+
+# GDScript backtrace frame: "[0] _ready (res://scripts/main.gd:4)".
+_FRAME_LINE = re.compile(r"^\[\d+\]\s*(?P<func>.*?)\s*\((?P<loc>[^()]*)\)\s*$")
+
+# Interactive -d frame: "*Frame 0 - res://scripts/main.gd:6 in function 'foo'".
+_D_FRAME = re.compile(
+    r"^\*Frame\s+\d+\s*-\s*(?P<loc>res://[^\s]+)\s+in function\s+'(?P<func>[^']*)'"
+)
+
+# Timestamped-format location, e.g. "file.gd:10 @ _ready()".
+_TS_LOC = re.compile(r"(?P<file>[^\s:@]+\.\w+):(?P<line>\d+)\s+@\s+(?P<func>.*?)\(\)")
+
+# Continuation markers that belong to the current diagnostic even when a line's
+# indentation was stripped by some capture pipeline.
+_CONT_PREFIXES = (
+    "at:",
+    "fix:",
+    "GDScript backtrace",
+    "<C++ Error>",
+    "<C++ Source>",
+    "<Stack Trace>",
+    "<GDScript>",
+    "*Frame ",
+)
+
+
+# Engine shutdown bookkeeping. When the process quits while something still
+# holds a reference, Godot prints these on the way out:
+#     ERROR: 1 resources still in use at exit (run with --verbose for details).
+#     WARNING: 2 ObjectDB instances were leaked at exit (run with `--verbose` for details).
+#     ERROR: 1 RID allocations of type 'P11GodotBody2D' were leaked at exit.
+#     WARNING: 1 RID of type "CanvasItem" was leaked.
+# The overwhelmingly common cause in a bounded test run is benign: an
+# AudioStreamPlayer (looping music, an autoplay stream) is still playing when
+# --quit-after fires, so its playback object is alive at teardown. Verified on
+# 4.7: a scene holding nothing but an autoplaying looped AudioStreamPlayer
+# produces exactly the first two lines. Treating them as errors made every game
+# with background music fail run_project.py / smoke_scenes.py, so they are filed
+# as severity "info", category "exit_leak": listed, explained, never counted as
+# an error or a warning. Real node leaks are reported precisely elsewhere
+# (smoke_scenes.py `orphan_nodes` / `node_growth`).
+_EXIT_LEAK = re.compile(
+    r"^(?:\d+ resources? still in use at exit"
+    r"|\d+ ObjectDB instances? (?:were|was) leaked at exit"
+    r"|\d+ RID allocations? of type .* (?:were|was) leaked at exit"
+    r"|\d+ RIDs? of type .* (?:were|was) leaked"
+    r"|Pages in use exist at exit in PagedAllocator"
+    r"|StringName: \d+ unclaimed string names? at exit)",
+    re.IGNORECASE,
+)
+_EXIT_LEAK_FIX = (
+    "Engine shutdown bookkeeping, not a gameplay error: something still held a reference when the run quit. "
+    "In a bounded run this is almost always audio that was still playing (looping music, an autoplay "
+    "AudioStreamPlayer) when --quit-after fired, which is harmless. To make it disappear, stop the players "
+    "before quitting (player.stop(); player.stream = null) or let the sound finish; to investigate a real "
+    "leak, re-run with --verbose to list the objects, and use smoke_scenes.py, whose orphan_nodes and "
+    "node_growth findings name leaked nodes precisely."
+)
+
+
+# Host capability probes. A machine with no GPU and no sound card — every
+# GPU-less Linux CI runner, every container, most remote boxes — makes Godot
+# print its failed driver probes as ERRORs and then recover:
+#     ERROR: Required Vulkan instance extension VK_KHR_surface not found.
+#        at: _initialize_instance_extensions (drivers/vulkan/rendering_context_driver_vulkan.cpp:494)
+#     ERROR: Condition "err != OK" is true. Returning: err
+#        at: initialize (drivers/vulkan/rendering_context_driver_vulkan.cpp:907)
+#     WARNING: Your video card drivers seem not to support the required Vulkan version, switching to OpenGL 3.
+#     ERROR: Condition "status < 0" is true. Returning: ERR_CANT_OPEN
+#        at: init_output_device (drivers/alsa/audio_driver_alsa.cpp:97)
+#     WARNING: All audio drivers failed, falling back to the dummy driver.
+# The run then renders, screenshots and asserts normally. Counting them as
+# errors made every windowed scenario fail on a GPU-less Linux host, which is
+# why the `can_render()` probes in the suite came back false under Xvfb even
+# though the PNG they asked for was sitting on disk — nine real-render tests
+# skipped themselves on a box that could render perfectly well.
+#
+# Keyed on the engine source file in the `at:` line rather than on the message,
+# because two of the three messages are generic engine assertions: nothing a
+# project can write produces a diagnostic inside a display or audio driver's
+# own initialisation, and the message text there changes between releases. The
+# list is deliberately the driver-initialisation sites only — a shader that fails to
+# compile is reported from servers/rendering/… and stays an error, and a driver
+# failure the engine cannot recover from still fails the run, because the
+# process then exits non-zero and produces no frames.
+_HOST_DRIVER_SOURCE = re.compile(
+    r"\bdrivers/(?:"
+    r"vulkan/rendering_context_driver_vulkan\.cpp"
+    r"|d3d12/rendering_context_driver_d3d12\.cpp"
+    r"|metal/rendering_context_driver_metal\.mm"
+    r"|alsa/audio_driver_alsa\.cpp"
+    r"|pulseaudio/audio_driver_pulseaudio\.cpp"
+    r"|wasapi/audio_driver_wasapi\.cpp"
+    r"|coreaudio/audio_driver_coreaudio\.cpp"
+    r"):\d+\)"
+)
+_HOST_CAPABILITY_FIX = (
+    "The host has no GPU or no sound card, so the engine probed a driver, failed, and fell back to another "
+    "one (look for the matching 'switching to OpenGL 3' / 'falling back to the dummy driver' warning). "
+    "Nothing in the project causes it and nothing in the project can fix it: it is normal on a headless "
+    "Linux box, a container or a CI runner. If you need the preferred driver, give the machine a GPU or an "
+    "audio device; otherwise ignore it — rendering, screenshots and audio buses all keep working."
+)
+
+
+def _host_capability(raw_lines: list[str]) -> bool:
+    """True when this diagnostic was raised inside a display/audio driver's own
+    initialisation, i.e. by the host's hardware rather than by the project."""
+    return any(_HOST_DRIVER_SOURCE.search(line) for line in raw_lines)
+
+
+# --- Category / suggested-fix heuristics -----------------------------------
+# Each rule is (needle_lowercased, category, suggested_fix). First match wins.
+_CATEGORY_RULES: list[tuple[str, str, str]] = [
+    (
+        "null instance",
+        "null_reference",
+        "A node or object is null. Check the NodePath / get_node() target exists and is spelled correctly, "
+        "use get_node_or_null() with a guard, or access it only after the node is in the tree (in _ready, "
+        "or via @onready).",
+    ),
+    (
+        "on a null value",
+        "null_reference",
+        "Calling a method on null. Guard the reference (if node: ...) or fix the assignment that left it null.",
+    ),
+    (
+        "nonexistent function",
+        "missing_method",
+        "The method does not exist on that type. Check for a typo, the correct node class, or an API renamed "
+        "between Godot versions (see the 4.x migration notes).",
+    ),
+    (
+        "not found in base",
+        "missing_method",
+        "The function/member is not found on the base type. Fix the name, cast to the right type, or declare it.",
+    ),
+    (
+        # PackedScene.instantiate() rejects the scene and returns null. Both
+        # shapes ("root node X cannot specify a parent node" and "node X does
+        # not specify its parent node") load without complaint, so only an
+        # instantiate pass reports them (check_project does this by default).
+        "invalid scene",
+        "scene_hierarchy",
+        "The .tscn node hierarchy is invalid, so PackedScene.instantiate() returns null and the scene is "
+        "unusable. In the file, the first [node] entry (the root) must have no parent= key, and every other "
+        "[node] entry must have one naming an existing node ('.' for a direct child of the root).",
+    ),
+    (
+        # The node is not lost: the engine reparents it to the scene root under
+        # a mangled "<path>#<name>" name, so the scene still runs, just with the
+        # wrong tree (and, for Control nodes, the wrong layout).
+        "has vanished when instantiating",
+        "scene_hierarchy",
+        "A [node] entry names a parent= path that does not exist at that point in the file, so the engine "
+        "reparented the node to the scene root under a mangled '<path>#<name>' name. Fix the parent= path "
+        "(it is relative to the root, with no leading './'), and make sure the parent node is declared "
+        "before its children. inspect_scene shows the resulting tree.",
+    ),
+    (
+        "nonexistent signal",
+        "signal",
+        "The signal is not declared on the emitter. Declare it with `signal name(...)`, fix the signal name, "
+        "or connect to the correct node.",
+    ),
+    (
+        "not declared in the current scope",
+        "undeclared_identifier",
+        "Identifier is undeclared. Declare the variable/const, fix the typo, or add the missing preload/import.",
+    ),
+    (
+        "invalid get index",
+        "invalid_index",
+        "Indexing failed. The key/index is missing or the base is the wrong type (often a null or empty "
+        "collection). Verify the property name and that the object is initialised.",
+    ),
+    (
+        "invalid set index",
+        "invalid_index",
+        "Assignment target index is invalid. Verify the property/key name and the object type.",
+    ),
+    (
+        "invalid access to property or key",
+        "invalid_member",
+        "Property or key does not exist on that object (or the object is null). Verify the member name and the "
+        "object's type.",
+    ),
+    (
+        "invalid call",
+        "invalid_call",
+        "The call target is invalid. Check the callee type and arguments.",
+    ),
+    (
+        "node not found",
+        "node_path",
+        "get_node() could not resolve the path. Fix the NodePath, ensure the node exists at that path, or use "
+        "get_node_or_null() plus a null check.",
+    ),
+    (
+        "trying to assign value of type",
+        "type_mismatch",
+        "A typed variable received an incompatible type. Convert the value or relax/fix the declared type.",
+    ),
+    (
+        "cannot convert",
+        "type_mismatch",
+        "A value cannot be converted to the expected type. Fix the value or the type annotation.",
+    ),
+    (
+        "failed to load script",
+        "resource_load",
+        "A script failed to load, usually because of a parse error above it. Fix the parse error first.",
+    ),
+    (
+        "failed to load resource",
+        "resource_load",
+        "A resource failed to load. Confirm the res:// path exists and the .uid metadata is intact "
+        "(get_uid / resave_resources can repair missing UID sidecars).",
+    ),
+    (
+        "resource file not found",
+        "resource_load",
+        "Referenced resource path does not exist. Fix the path or restore the file; repair UIDs if a move "
+        "broke the reference (get_uid / resave_resources).",
+    ),
+    (
+        "cannot open file",
+        "resource_load",
+        "A file path could not be opened. Confirm the res:// path and that the file was exported/committed.",
+    ),
+    (
+        "parse error",
+        "parse_error",
+        "GDScript failed to compile. Fix the syntax/identifier at the reported line; the script will not run "
+        "until it parses.",
+    ),
+    (
+        "shader",
+        "shader",
+        "A shader failed to compile. Fix the reported shader line; uniforms and varyings must match their use.",
+    ),
+    (
+        "condition \"",
+        "engine_assertion",
+        "An engine precondition failed. Usually a call made in the wrong state/order (e.g. before the node is "
+        "in the tree). Move the call or satisfy the precondition.",
+    ),
+]
+
+_SEVERITY_ORDER = {
+    "parse_error": 0,
+    "script_error": 1,
+    "shader_error": 1,
+    "error": 2,
+    "warning": 3,
+    "info": 4,
+}
+
+
+class _Diagnostic:
+    __slots__ = (
+        "severity",
+        "message",
+        "file",
+        "line",
+        "function",
+        "stack",
+        "raw_lines",
+        "fallback",
+        "context_file",
+        "rule",
+        "node_path",
+        "explicit_fix",
+    )
+
+    def __init__(self, severity: str, message: str) -> None:
+        self.severity = severity
+        self.message = message.strip()
+        self.file: Optional[str] = None
+        self.line: Optional[int] = None
+        self.function: Optional[str] = None
+        self.stack: list[dict] = []
+        self.raw_lines: list[str] = []
+        # Location parsed out of the header message itself, used only when no
+        # `at:`/backtrace line supplied a better one (see set_fallback_location).
+        # The line may be None when the message names a file but no line.
+        self.fallback: Optional[tuple[str, Optional[int]]] = None
+        # File the enclosing tool said it was working on, used to attribute a
+        # pathless diagnostic (shader compile errors) to a source file.
+        self.context_file: Optional[str] = None
+        # Set for a `[node_config:<rule>]` warning from check_project: the rule
+        # id, the node it is about, and the runnable fix from its `fix:` line.
+        self.rule: Optional[str] = None
+        self.node_path: Optional[str] = None
+        self.explicit_fix: Optional[str] = None
+
+    def set_fallback_location(self, file: str, line: Optional[int]) -> None:
+        if self.fallback is None:
+            self.fallback = (file, line)
+
+    def apply_fallback(self) -> None:
+        if self.file is None and self.fallback is not None:
+            self.file, self.line = self.fallback
+
+    def set_location(self, file: str, line: int, function: Optional[str]) -> None:
+        # First concrete res:// location wins (the crash site), except we never
+        # overwrite it with a later, less-specific frame.
+        if self.file is None:
+            self.file = file
+            self.line = line
+            if function and function not in ("", "GDScript::reload"):
+                self.function = function
+
+    def to_dict(self) -> dict:
+        category, suggested_fix = _classify(self.message)
+        if _EXIT_LEAK.match(self.message):
+            self.severity = "info"
+            category, suggested_fix = "exit_leak", _EXIT_LEAK_FIX
+        elif self.severity in ("error", "warning") and _host_capability(self.raw_lines):
+            self.severity = "info"
+            category, suggested_fix = "host_capability", _HOST_CAPABILITY_FIX
+        if self.rule is not None:
+            category = "node_config"
+            if self.explicit_fix:
+                suggested_fix = self.explicit_fix
+        payload = {
+            "severity": self.severity,
+            "category": category,
+            "message": self.message,
+            "file": self.file,
+            "line": self.line,
+            "function": self.function,
+            "stack": self.stack,
+            "suggested_fix": suggested_fix,
+            "raw": "\n".join(self.raw_lines).rstrip(),
+        }
+        if self.rule is not None:
+            payload["rule"] = self.rule
+            payload["node_path"] = self.node_path
+        return payload
+
+
+def _classify(message: str) -> tuple[str, str]:
+    lowered = message.lower()
+    for needle, category, fix in _CATEGORY_RULES:
+        if needle in lowered:
+            return category, fix
+    return "unknown", (
+        "Open the referenced file:line, read the message, and fix the offending statement. "
+        "Re-run to confirm the diagnostic clears."
+    )
+
+
+def _match_header(stripped: str) -> Optional[tuple[str, str]]:
+    for pattern, severity in _HEADER_PATTERNS:
+        match = pattern.match(stripped)
+        if match:
+            return severity, match.group(1).strip()
+    return None
+
+
+def _is_continuation(stripped: str) -> bool:
+    return stripped.startswith(_CONT_PREFIXES)
+
+
+def _apply_continuation(diag: _Diagnostic, stripped: str) -> None:
+    """Pull file/line/function and stack frames out of a continuation line."""
+    if diag.rule is not None:
+        # A node_config warning's only continuation is its runnable fix, and the
+        # JSON inside it must never be mined for a res:// location.
+        fix_match = _NODE_CONFIG_FIX.match(stripped)
+        if fix_match:
+            diag.explicit_fix = fix_match.group("fix").strip()
+        return
+
+    at_match = _AT_LINE.match(stripped)
+    if at_match:
+        loc = at_match.group("loc")
+        res = _RES_LOC.search(loc)
+        if res:
+            diag.set_location(res.group(1), int(res.group(2)), at_match.group("func"))
+            return
+        bare = _BARE_LINE_LOC.match(loc.strip())
+        if bare and diag.context_file:
+            diag.set_fallback_location(diag.context_file, int(bare.group(1)))
+        return
+
+    frame_match = _FRAME_LINE.match(stripped)
+    if frame_match:
+        loc = frame_match.group("loc")
+        res = _RES_LOC.search(loc)
+        if res:
+            func = frame_match.group("func")
+            frame = {"function": func, "file": res.group(1), "line": int(res.group(2))}
+            diag.stack.append(frame)
+            diag.set_location(frame["file"], frame["line"], func)
+        return
+
+    d_frame = _D_FRAME.match(stripped)
+    if d_frame:
+        res = _RES_LOC.search(d_frame.group("loc"))
+        if res:
+            func = d_frame.group("func")
+            frame = {"function": func, "file": res.group(1), "line": int(res.group(2))}
+            diag.stack.append(frame)
+            diag.set_location(frame["file"], frame["line"], func)
+        return
+
+    # Fallback: any res:// location on a continuation line.
+    res = _RES_LOC.search(stripped)
+    if res:
+        diag.set_location(res.group(1), int(res.group(2)), None)
+
+
+def parse_log(text: str, include_warnings: bool = True) -> dict:
+    """Parse Godot output text into a structured diagnostics report.
+
+    Returns a dict with ``diagnostics`` (deduplicated, most-severe first) and a
+    ``counts`` summary. Set ``include_warnings=False`` to drop warnings.
+    """
+    diagnostics: list[_Diagnostic] = []
+    current: Optional[_Diagnostic] = None
+    # Most recent "Compiling shader: <path>" marker, used to give pathless
+    # SHADER ERROR blocks a file to point at.
+    shader_context: Optional[str] = None
+
+    def close() -> None:
+        nonlocal current
+        if current is not None:
+            current.apply_fallback()
+            diagnostics.append(current)
+            current = None
+
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+
+        marker = _SHADER_CONTEXT.match(stripped)
+        if marker:
+            close()
+            shader_context = marker.group(1)
+            continue
+
+        header = _match_header(stripped)
+
+        if header is not None:
+            close()
+            severity, message = header
+            current = _Diagnostic(severity, message)
+            current.context_file = shader_context if severity == "shader_error" else None
+            current.raw_lines.append(raw_line.rstrip())
+
+            # A node configuration warning from check_project names the scene
+            # and the node instead of a file:line.
+            node_config = _NODE_CONFIG.match(message)
+            if node_config:
+                current.rule = node_config.group("rule")
+                current.node_path = node_config.group("path")
+                current.message = node_config.group("message").strip()
+                current.set_fallback_location(node_config.group("file"), None)
+                continue
+
+            # The timestamped "E 0:00:.. file.gd:10 @ func(): msg" header also
+            # carries its own location inline.
+            ts = _TS_LOC.search(stripped)
+            if ts:
+                current.set_location(ts.group("file"), int(ts.group("line")), ts.group("func"))
+                continue
+
+            # Resource-loader diagnostics put the location in the message itself:
+            # "ERROR: res://scenes/main.tscn:9 - Parse Error: [ext_resource] ...".
+            # Only used if no `at:`/backtrace line gives a real location, so a
+            # runtime error's crash site always wins.
+            res = _RES_MSG_LOC.match(message)
+            if res:
+                current.set_fallback_location(res.group(1), int(res.group(2)))
+                continue
+
+            # Engine messages that quote the file they concern but report no
+            # line (the scene-instantiation warnings above all look like this).
+            quoted = _QUOTED_RES_PATH.search(message)
+            if quoted:
+                current.set_fallback_location(quoted.group(1), None)
+            continue
+
+        if current is None:
+            continue
+
+        if stripped == "":
+            close()
+            continue
+
+        indented = raw_line[:1].isspace()
+        if indented or _is_continuation(stripped):
+            current.raw_lines.append(raw_line.rstrip())
+            _apply_continuation(current, stripped)
+            continue
+
+        # A non-indented, non-header, non-blank line ends the current block.
+        close()
+
+    close()
+
+    if not include_warnings:
+        diagnostics = [d for d in diagnostics if d.severity != "warning"]
+
+    payload = [d.to_dict() for d in diagnostics]
+    if not include_warnings:
+        # to_dict() is what files shutdown bookkeeping as "info"; it goes with the
+        # warnings when the caller asked for errors only.
+        payload = [d for d in payload if d["severity"] != "info"]
+    deduped = _dedupe(payload)
+    deduped.sort(key=lambda d: _SEVERITY_ORDER.get(d["severity"], 9))
+
+    counts = {
+        "total": len(deduped),
+        "errors": sum(1 for d in deduped if d["severity"] in ("error", "script_error", "shader_error")),
+        "parse_errors": sum(1 for d in deduped if d["severity"] == "parse_error"),
+        "warnings": sum(1 for d in deduped if d["severity"] == "warning"),
+        "info": sum(1 for d in deduped if d["severity"] == "info"),
+    }
+    return {"diagnostics": deduped, "counts": counts}
+
+
+def _dedupe(diagnostics: list[dict]) -> list[dict]:
+    seen: dict[tuple, dict] = {}
+    order: list[tuple] = []
+    for diag in diagnostics:
+        # node_config warnings share a file and carry no line, so the node path
+        # is what keeps two different broken nodes from collapsing into one.
+        key = (diag["severity"], diag["file"], diag["line"], diag["message"], diag.get("node_path"))
+        if key in seen:
+            seen[key]["occurrences"] += 1
+        else:
+            entry = dict(diag)
+            entry["occurrences"] = 1
+            seen[key] = entry
+            order.append(key)
+    return [seen[key] for key in order]
+
+
+def _read_input(path: Optional[str]) -> str:
+    if path and path != "-":
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    return sys.stdin.read()
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Parse Godot stdout/stderr into structured diagnostics (JSON)."
+    )
+    parser.add_argument(
+        "file",
+        nargs="?",
+        default="-",
+        help="Log file to read, or '-' for stdin (default: stdin).",
+    )
+    parser.add_argument(
+        "--no-warnings",
+        action="store_true",
+        help="Drop warnings from the report.",
+    )
+    parser.add_argument(
+        "--pretty",
+        action="store_true",
+        help="Pretty-print the JSON output.",
+    )
+    args = parser.parse_args(argv or sys.argv[1:])
+
+    report = parse_log(_read_input(args.file), include_warnings=not args.no_warnings)
+    print(json.dumps(report, indent=2 if args.pretty else None))
+    # Exit non-zero when any error-level diagnostic was found, so shell callers
+    # can branch on it.
+    return 1 if report["counts"]["errors"] or report["counts"]["parse_errors"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

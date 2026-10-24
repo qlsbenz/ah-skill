@@ -1,0 +1,9 @@
+# Git workflow domain — skills and rules for commits, PRs, and releases.
+# Requires nothing from the environment except a working git repo at skill-execution time.
+# Rules, skills, and agents install into the target project .agents/.
+
+name: git
+description: Git workflow — Conventional Commits, PR descriptions, semver releases.
+
+requires_env: []
+

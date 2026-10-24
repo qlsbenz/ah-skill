@@ -1,0 +1,71 @@
+{
+  "description": "Project test gate for Codex agent and subagent stops.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__TEST_GATE_COMMAND__"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__TEST_GATE_COMMAND__"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|apply_patch|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__TEST_GATE_COMMAND__"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|apply_patch|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__TEST_GATE_COMMAND__"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__TEST_GATE_COMMAND__",
+            "timeout": 30,
+            "statusMessage": "Checking test execution"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__TEST_GATE_COMMAND__",
+            "timeout": 30,
+            "statusMessage": "Checking test execution"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,4 @@
+# Codex code workflow and supporting role instructions.
+name: code
+description: Feature planning, implementation, review, debugging, project setup, and Godot development.
+requires_env: []
